@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drive-rl"
+version = "0.1.0"
+description = "Teach an RL agent to drive on Gymnasium CarRacing-v3 with PPO."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Learn-to-Drive-with-RL contributors" }]
+keywords = ["reinforcement-learning", "ppo", "gymnasium", "self-driving", "car-racing"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: PyTorch",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Core RL stack
+    "stable-baselines3>=2.3.0",
+    "sb3-contrib>=1.8.0",
+    "gymnasium[box2d]>=0.29.1",
+    # Deep learning backend
+    "torch>=2.1.0",
+    # Computer vision / image processing
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    # Logging + monitoring
+    "tensorboard>=2.15.0",
+    # Rendering (required at import time by CarRacing even for headless use)
+    "pygame>=2.5.0",
+    # Building box2d-py on Windows
+    "swig>=4.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.4.0",
+    "black>=24.0.0",
+]
+
+[project.scripts]
+drive-rl-train = "drive_rl.train:main"
+drive-rl-evaluate = "drive_rl.evaluate:main"
+drive-rl-record = "drive_rl.record_video:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning:gymnasium.*",
+    "ignore::DeprecationWarning:stable_baselines3.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
