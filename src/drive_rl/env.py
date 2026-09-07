@@ -17,24 +17,14 @@ from typing import Any
 
 import gymnasium as gym
 from gymnasium.wrappers import GrayscaleObservation, ResizeObservation
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecFrameStack
 
 ENV_ID = "CarRacing-v3"
 
 
-def _make_single_env(
-    seed: int,
-    rank: int,
-    render_mode: str | None = None,
-) -> Any:
-    """Build one CarRacing-v3 env with the standard preprocessing chain.
-
-    SB3's `make_vec_env` calls this for each sub-env. `rank` is used to give
-    each env a distinct seed even when the caller only passes one seed.
-    """
-
+def _make_thunk(seed: int, rank: int, render_mode: str | None = None) -> Any:
+    """Return a zero-arg callable that builds one preprocessed CarRacing-v3 env."""
     def _thunk() -> gym.Env:
         env = gym.make(ENV_ID, continuous=True, render_mode=render_mode)
         env = GrayscaleObservation(env, keep_dim=True)  # (96, 96, 1)
@@ -42,7 +32,6 @@ def _make_single_env(
         env = Monitor(env)  # records episode reward/length for SB3 logging
         env.reset(seed=seed + rank)
         return env
-
     return _thunk
 
 
@@ -71,12 +60,8 @@ def make_env(
     if vec_cls is None:
         vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
 
-    env = make_vec_env(
-        _make_single_env(seed=seed, render_mode=render_mode),
-        n_envs=n_envs,
-        seed=seed,
-        vec_env_cls=vec_cls,
-    )
+    env_fns = [_make_thunk(seed=seed, rank=i, render_mode=render_mode) for i in range(n_envs)]
+    env = vec_cls(env_fns)
     env = VecFrameStack(env, n_stack=n_stack, channels_order="first")
     return env
 
