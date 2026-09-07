@@ -3,9 +3,8 @@
 Pipeline applied to each env:
   1. `gymnasium.make("CarRacing-v3", continuous=True)` — continuous Box-3 action.
   2. `RecordEpisodeStatistics` — surface `episode` info for SB3 callbacks.
-  3. `GrayscaleObservation` — RGB → single channel.
-  4. `ResizeObservation` — downsample to 84×84.
-  5. SB3 `VecFrameStack(n_stack=4)` — stack last N frames into a single obs.
+  3. Custom `GrayscaleResize` — RGB → single channel → 84×84 (keeps channel dim).
+  4. SB3 `VecFrameStack(n_stack=4)` — stack last N frames into a single obs.
 
 The resulting VecEnv observation space is `Box(0, 255, (4, 84, 84), uint8)`,
 ready for SB3's `CnnPolicy`.
@@ -15,20 +14,39 @@ from __future__ import annotations
 
 from typing import Any
 
+import cv2
 import gymnasium as gym
-from gymnasium.wrappers import GrayscaleObservation, ResizeObservation
+import numpy as np
+from gymnasium import ObservationWrapper, spaces
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecFrameStack
 
 ENV_ID = "CarRacing-v3"
+TARGET_SHAPE = (84, 84)
+
+
+class GrayscaleResize(ObservationWrapper):
+    """Convert RGB to grayscale and resize to 84x84, keeping channel dim."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        assert isinstance(env.observation_space, spaces.Box)
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(TARGET_SHAPE[0], TARGET_SHAPE[1], 1), dtype=np.uint8
+        )
+
+    def observation(self, obs: np.ndarray) -> np.ndarray:
+        # obs: (H, W, 3) RGB uint8
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)  # (H, W)
+        resized = cv2.resize(gray, TARGET_SHAPE[::-1], interpolation=cv2.INTER_AREA)  # (84, 84)
+        return resized[:, :, None]  # (84, 84, 1)
 
 
 def _make_thunk(seed: int, rank: int, render_mode: str | None = None) -> Any:
     """Return a zero-arg callable that builds one preprocessed CarRacing-v3 env."""
     def _thunk() -> gym.Env:
         env = gym.make(ENV_ID, continuous=True, render_mode=render_mode)
-        env = GrayscaleObservation(env, keep_dim=True)  # (96, 96, 1)
-        env = ResizeObservation(env, shape=(84, 84))  # (84, 84, 1)
+        env = GrayscaleResize(env)  # (84, 84, 1)
         env = Monitor(env)  # records episode reward/length for SB3 logging
         env.reset(seed=seed + rank)
         return env
