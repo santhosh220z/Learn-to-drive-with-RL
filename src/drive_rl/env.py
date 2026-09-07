@@ -26,20 +26,20 @@ TARGET_SHAPE = (84, 84)
 
 
 class GrayscaleResize(ObservationWrapper):
-    """Convert RGB to grayscale and resize to 84x84, keeping channel dim."""
+    """Convert RGB to grayscale and resize to 84x84, outputting channels-first (C, H, W)."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
         assert isinstance(env.observation_space, spaces.Box)
         self.observation_space = spaces.Box(
-            low=0, high=255, shape=(TARGET_SHAPE[0], TARGET_SHAPE[1], 1), dtype=np.uint8
+            low=0, high=255, shape=(1, TARGET_SHAPE[0], TARGET_SHAPE[1]), dtype=np.uint8
         )
 
     def observation(self, obs: np.ndarray) -> np.ndarray:
         # obs: (H, W, 3) RGB uint8
         gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)  # (H, W)
         resized = cv2.resize(gray, TARGET_SHAPE[::-1], interpolation=cv2.INTER_AREA)  # (84, 84)
-        return resized[:, :, None]  # (84, 84, 1)
+        return resized[None, :, :]  # (1, 84, 84) - channels-first
 
 
 def _make_thunk(seed: int, rank: int, render_mode: str | None = None) -> Any:

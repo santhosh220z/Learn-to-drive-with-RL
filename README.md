@@ -2,7 +2,7 @@
 
 Train a reinforcement-learning agent to drive on **Gymnasium `CarRacing-v3`** using **PPO** from [Stable-Baselines3](https://stable-baselines3.readthedocs.io/). Vision-based policy (`CnnPolicy`) over stacked 84×84 grayscale frames, with TensorBoard logging, a deterministic eval harness, and a video-recording script for demos.
 
-> **Status**: end-to-end pipeline implemented (env, training, eval, video, tests, docs). Baseline PPO + headline numbers pending a real run on your machine.
+> **Status**: ✅ End-to-end pipeline working. Smoke test (10k steps, 2 envs) passes on CPU. Baseline PPO training in progress.
 
 ---
 
@@ -69,6 +69,17 @@ python -c "import gymnasium as gym; e = gym.make('CarRacing-v3', continuous=True
 
 You should see `Box(0, 255, (96, 96, 3), uint8)` and `Box(-1, [+1,+1,+1], (3,), float32)`.
 
+Verify the full preprocessing pipeline:
+
+```bash
+python -c "
+from drive_rl.env import make_env, DummyVecEnv
+env = make_env(n_envs=1, vec_cls=DummyVecEnv)
+print('VecEnv obs space:', env.observation_space)
+print('Expected: Box(0, 255, (4, 84, 84), uint8)')
+"
+```
+
 ---
 
 ## Usage
@@ -79,7 +90,7 @@ You should see `Box(0, 255, (96, 96, 3), uint8)` and `Box(-1, [+1,+1,+1], (3,), 
 python -m drive_rl.train --timesteps 10000 --n-envs 2
 ```
 
-### Train (headline baseline)
+### Train (headline baseline, uses GPU if available)
 
 ```bash
 python -m drive_rl.train --timesteps 1000000 --n-envs 8 --seed 0
@@ -127,8 +138,7 @@ tensorboard --logdir models/ppo_carracing_<ts>/tb
 
 1. **`make_env()`** in [`src/drive_rl/env.py`](src/drive_rl/env.py) builds a vectorized CarRacing-v3 with the standard preprocessing chain:
    - `gym.make("CarRacing-v3", continuous=True)` → `Box(steer, gas, brake) ∈ [-1,1]^3`
-   - `GrayscaleObservation` → `(96, 96, 1)`
-   - `ResizeObservation` → `(84, 84, 1)`
+   - Custom `GrayscaleResize` wrapper → `(84, 84, 1)` (RGB → grayscale + resize, keeps channel dim)
    - SB3 `VecFrameStack(n_stack=4)` → `(4, 84, 84)` uint8
 2. **PPO** with `CnnPolicy` learns a policy over the frame stack.
 3. **`EvalCallback`** runs deterministic evaluation every `--eval-freq` steps and saves the best model.
@@ -145,6 +155,11 @@ tensorboard --logdir models/ppo_carracing_<ts>/tb
 - `FrameSkipWrapper(skip=4)` — repeat actions for K frames and sum rewards.
 
 Wire them in `env.py` if you want to use them.
+
+### Fixed issues
+
+- **Channel dimension bug**: Gymnasium's `ResizeObservation` was dropping the channel dim (returning `(84, 84)` instead of `(84, 84, 1)`), causing `VecFrameStack` broadcast errors. Fixed with a custom `GrayscaleResize` wrapper using OpenCV that preserves the channel dimension.
+- **SubprocVecEnv pickling**: The env factory now returns a list of callables compatible with SB3's `make_vec_env` / `SubprocVecEnv` on Windows.
 
 ---
 
