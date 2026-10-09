@@ -41,7 +41,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import gymnasium
 import numpy as np
+from gymnasium import spaces
 
 from drive_rl.circuits import Circuit, ReferenceLine, build_map_class, get_circuit, map_config
 
@@ -419,3 +421,114 @@ class CameraObservation:
         stacked = np.transpose(image, (3, 2, 0, 1))
         height, width = stacked.shape[2], stacked.shape[3]
         return np.ascontiguousarray(stacked.reshape(-1, height, width), dtype=np.float32)
+
+
+class CameraObsWrapper(gymnasium.ObservationWrapper):
+    """Expose MetaDrive's stacked RGB frame as a single channels-first array.
+
+    MetaDrive reports camera observations as a dict; a CNN policy wants one
+    array. The observation space is declared from the configured image size and
+    stack depth, so no reset is consumed to discover it.
+    """
+
+    def __init__(self, env, image_size: int, stack_size: int) -> None:
+        super().__init__(env)
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(stack_size * 3, image_size, image_size),
+            dtype=np.float32,
+        )
+
+    def observation(self, observation):
+        return CameraObservation.to_channels_first(observation)
+
+
+def make_racing_vec_env(
+    n_envs: int = 4,
+    *,
+    circuit: str = DEFAULT_CIRCUIT,
+    obs_mode: str = "state",
+    seed: int = 0,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    stack_size: int = DEFAULT_STACK_SIZE,
+    racing: RacingParams | None = None,
+    norm_obs: bool | None = None,
+    norm_reward: bool = True,
+    vec_cls: str = "auto",
+    render: bool = False,
+):
+    """Build a vectorised racing environment for Stable-Baselines3.
+
+    MetaDrive's simulation engine supports only one environment instance per
+    process, so parallel environments are separate processes rather than threads.
+    That caps usable parallelism at the number of CPU cores.
+
+    Args:
+        n_envs: Number of parallel environments.
+        circuit: Circuit name.
+        obs_mode: ``"state"`` or ``"camera"``.
+        seed: Base seed; environment ``i`` gets ``seed + i``.
+        image_size: Camera observation side length.
+        stack_size: Frames stacked into the camera observation.
+        racing: Reward and termination parameters.
+        norm_obs: Normalise observations. Defaults to ``True`` for ``"state"``
+            mode and ``False`` for ``"camera"``, where a running mean would
+            destroy the 0-1 pixel scale.
+        norm_reward: Normalise rewards by return scale.
+        vec_cls: ``"auto"``, ``"dummy"`` or ``"subproc"``.
+        render: Open a 3D window. Only sensible with ``n_envs=1``.
+
+    Returns:
+        A ``VecEnv``, optionally wrapped in ``VecNormalize``.
+
+    Raises:
+        ValueError: If ``n_envs`` is less than one.
+    """
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import (
+        DummyVecEnv,
+        SubprocVecEnv,
+        VecNormalize,
+    )
+
+    if n_envs < 1:
+        raise ValueError(f"n_envs must be >= 1, got {n_envs}")
+    if render and n_envs > 1:
+        raise ValueError("render=True requires n_envs=1; a window per environment is not useful")
+    if norm_obs is None:
+        norm_obs = obs_mode == "state"
+
+    def make_thunk(rank: int):
+        def _init():
+            env = make_racing_env(
+                circuit,
+                obs_mode=obs_mode,
+                image_size=image_size,
+                stack_size=stack_size,
+                racing=racing,
+                render=render,
+                log_level=30,
+            )
+            if obs_mode == "camera":
+                env = CameraObsWrapper(env, image_size, stack_size)
+            env = Monitor(env)
+            env.reset(seed=seed + rank)
+            return env
+
+        return _init
+
+    thunks = [make_thunk(rank) for rank in range(n_envs)]
+    if vec_cls == "auto":
+        chosen = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+    elif vec_cls == "dummy":
+        chosen = DummyVecEnv
+    elif vec_cls == "subproc":
+        chosen = SubprocVecEnv
+    else:
+        raise ValueError(f"unknown vec_cls {vec_cls!r}")
+    vec = chosen(thunks)
+
+    if norm_obs or norm_reward:
+        vec = VecNormalize(vec, norm_obs=norm_obs, norm_reward=norm_reward, clip_obs=10.0)
+    return vec
