@@ -34,9 +34,11 @@ Fidelity limits, deliberately accepted and documented rather than hidden:
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
+
+import numpy as np
 
 # Directions, matching MetaDrive's `Parameter.dir` convention.
 RIGHT = 1  # clockwise
@@ -500,3 +502,163 @@ def describe(circuit: Circuit) -> Iterable[str]:
     yield f"  lane width {circuit.lane_width:.1f} m"
     if circuit.description:
         yield f"  {circuit.description}"
+
+
+# --------------------------------------------------------------------------- #
+# Reference line
+# --------------------------------------------------------------------------- #
+
+DEFAULT_SAMPLE_SPACING = 2.0  # metres between centreline samples
+
+
+def sample_centerline(
+    circuit: Circuit, spacing: float = DEFAULT_SAMPLE_SPACING
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample a circuit's centreline into a polyline.
+
+    Walks the block sequence analytically, emitting points every ``spacing``
+    metres along straights and around arcs. Because the centreline is closed, the
+    final point is not repeated -- arc-length wraps from ``lap_length`` back to 0.
+
+    Args:
+        circuit: The circuit to sample.
+        spacing: Distance between samples, in metres.
+
+    Returns:
+        ``(points, arc_length)`` where ``points`` is ``(N, 2)`` float64 and
+        ``arc_length`` is ``(N,)`` cumulative distance from the start.
+    """
+    if spacing <= 0:
+        raise ValueError(f"spacing must be > 0, got {spacing}")
+
+    x, y, heading = 0.0, 0.0, 0.0
+    accumulated = 0.0
+    points: list[tuple[float, float]] = [(x, y)]
+    arc: list[float] = [0.0]
+
+    def emit(nx: float, ny: float, extra: float) -> None:
+        nonlocal accumulated
+        accumulated += extra
+        points.append((nx, ny))
+        arc.append(accumulated)
+
+    def run_straight(length: float) -> None:
+        """Advance along the current heading, sampling every ``spacing`` metres."""
+        nonlocal x, y
+        remaining = length
+        while remaining > 1e-9:
+            step = min(spacing, remaining)
+            x += step * math.cos(heading)
+            y += step * math.sin(heading)
+            emit(x, y, step)
+            remaining -= step
+
+    for block in circuit.blocks:
+        if block.kind == "curve":
+            alpha = block.signed_angle
+            if alpha != 0.0:
+                # Centre of the arc sits one radius perpendicular to the heading,
+                # on the side being turned toward: left for a positive
+                # (counter-clockwise) sweep, right for a negative one.
+                radius = block.radius
+                turn = 1.0 if alpha > 0 else -1.0
+                cx = x - turn * radius * math.sin(heading)
+                cy = y + turn * radius * math.cos(heading)
+                rx, ry = x - cx, y - cy
+                angle_remaining = abs(alpha)
+
+                while angle_remaining > 1e-9:
+                    step_angle = min(spacing / radius, angle_remaining)
+                    signed = turn * step_angle
+                    rx, ry = (
+                        rx * math.cos(signed) - ry * math.sin(signed),
+                        rx * math.sin(signed) + ry * math.cos(signed),
+                    )
+                    x, y = cx + rx, cy + ry
+                    heading += signed
+                    emit(x, y, radius * step_angle)
+                    angle_remaining -= step_angle
+
+        # A straight block contributes its length directly; a curve contributes
+        # the straight run-off that follows its arc.
+        run_straight(block.length)
+
+    pts = np.asarray(points, dtype=np.float64)
+    arcs = np.asarray(arc, dtype=np.float64)
+    # Drop a trailing point that duplicates the start (a lap-length-exact sample).
+    if len(pts) > 1 and math.dist(pts[-1], pts[0]) < 1e-6:
+        pts, arcs = pts[:-1], arcs[:-1]
+    return pts, arcs
+
+
+class ReferenceLine:
+    """A closed racing line that vehicles can be located against.
+
+    Provides the two quantities a racing reward needs: how far around the lap a
+    point is, and how far off the centreline it is. Both are computed by
+    projecting onto the sampled centreline.
+
+    Unlike MetaDrive's own lane bookkeeping this does not depend on internal lane
+    or node identifiers, so progress stays well-defined on a closed loop.
+    """
+
+    def __init__(self, circuit: Circuit, spacing: float = DEFAULT_SAMPLE_SPACING) -> None:
+        self.circuit = circuit
+        self.points, self.arc_length = sample_centerline(circuit, spacing)
+        self.lap_length = float(self.arc_length[-1])
+        if len(self.points) < 2:
+            raise ValueError(f"{circuit.name}: centreline too short to build a reference")
+
+        # Segment start points and unit-ish direction vectors, for projection.
+        self._starts = self.points[:-1]
+        self._vectors = np.diff(self.points, axis=0)
+        self._seg_len = np.linalg.norm(self._vectors, axis=1)
+        self._seg_len_sq = np.maximum(self._seg_len**2, 1e-9)
+
+    def project(self, position: Sequence[float]) -> tuple[float, float]:
+        """Locate a world position on the reference line.
+
+        Args:
+            position: ``(x, y)`` world coordinates.
+
+        Returns:
+            ``(arc_length, lateral)`` -- distance travelled around the lap in
+            ``[0, lap_length)``, and signed distance from the centreline where
+            positive is to the left of the direction of travel.
+        """
+        q = np.asarray(position, dtype=np.float64)
+        rel = q - self._starts
+        t = np.clip((rel * self._vectors).sum(axis=1) / self._seg_len_sq, 0.0, 1.0)
+        proj = self._starts + t[:, None] * self._vectors
+        dist_sq = ((proj - q) ** 2).sum(axis=1)
+        i = int(np.argmin(dist_sq))
+
+        s = float(self.arc_length[i] + t[i] * self._seg_len[i])
+        if s >= self.lap_length:
+            s = float(s % self.lap_length)
+
+        vx, vy = self._vectors[i]
+        # Cross product of the segment direction with the offset to the query;
+        # positive means the point sits to the left of travel.
+        cross = vx * (q[1] - self._starts[i, 1]) - vy * (q[0] - self._starts[i, 0])
+        lateral = float(np.copysign(math.sqrt(dist_sq[i]), cross))
+        return s, lateral
+
+    def sample(self, s: float) -> np.ndarray:
+        """Position and tangent at a given arc length.
+
+        Args:
+            s: Arc length in metres, wrapped modulo the lap length.
+
+        Returns:
+            ``(position, tangent)`` where position is ``(2,)`` and tangent is a
+            unit ``(2,)`` vector pointing along the direction of travel.
+        """
+        s = float(s % self.lap_length)
+        i = int(np.searchsorted(self.arc_length, s, side="right") - 1)
+        i = max(0, min(i, len(self._seg_len) - 1))
+        frac = (s - self.arc_length[i]) / max(self._seg_len[i], 1e-9)
+        frac = float(np.clip(frac, 0.0, 1.0))
+        position = self._starts[i] + frac * self._vectors[i]
+        tangent = self._vectors[i] / max(self._seg_len[i], 1e-9)
+        return position, tangent
