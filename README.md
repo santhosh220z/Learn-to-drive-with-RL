@@ -1,196 +1,252 @@
-# Learn-to-Drive-with-RL
+# Learn to Drive with RL
 
-Train a reinforcement-learning agent to drive on **Gymnasium `CarRacing-v3`** using **PPO** from [Stable-Baselines3](https://stable-baselines3.readthedocs.io/). Vision-based policy (`CnnPolicy`) over stacked 84×84 grayscale frames, with TensorBoard logging, a deterministic eval harness, and a video-recording script for demos.
+Teach a reinforcement-learning agent to drive a racing line, on **MetaDrive** with **PPO**
+from [Stable-Baselines3](https://stable-baselines3.readthedocs.io/).
 
-> **Status**: ✅ End-to-end pipeline working. Smoke test (10k steps, 2 envs) passes on CPU. Baseline PPO training in progress.
+The agent laps real circuits — Suzuka, Silverstone, Monaco — in a 3D simulated world,
+learning from a progress-based racing reward with lap timing.
+
+> **Status:** Pipeline working end to end. Circuits validate and close, the environment
+> runs in MetaDrive, and a reference-line follower completes a full lap of Suzuka in
+> 217 s. No trained policy yet — training is left to you.
 
 ---
 
-## Project structure
+## Why MetaDrive
+
+The previous version of this project used Gymnasium's `CarRacing-v3`, a 2D Box2D
+toy where the reward is "visit tiles quickly". That teaches generic racing; it has no
+notion of a racing line, lap time, or tire behaviour, and its top-down 84x84 camera is
+about as far from a driver's view as you can get.
+
+MetaDrive is a 3D simulator built on Panda3D with Bullet rigid-body physics, and it
+composes road networks out of *blocks* — which is exactly the vocabulary a circuit is
+made of:
 
 ```text
-.
-├── pyproject.toml
-├── README.md
-├── LICENSE
-├── .gitignore
-├── src/
-│   └── drive_rl/
-│       ├── __init__.py
-│       ├── env.py            # make_env(): gray + resize + frame-stack VecEnv
-│       ├── wrappers.py       # Optional: action smoothing, reward shaping, frame skip
-│       ├── callbacks.py      # SaveBestModelByReward + EvalCallback composition
-│       ├── train.py          # `python -m drive_rl.train`
-│       ├── evaluate.py       # `python -m drive_rl.evaluate`
-│       ├── record_video.py   # `python -m drive_rl.record_video`
-│       └── utils.py          # seeding + device helpers
-├── configs/
-│   └── default_ppo.yaml      # Hyperparameter preset
-├── tests/
-│   ├── test_env.py           # VecEnv shape / action / step contracts
-│   ├── test_wrappers.py      # Wrapper unit tests
-│   └── test_train_smoke.py   # 512-step PPO integration test
-├── models/                   # Saved checkpoints (gitignored)
-├── videos/                   # Recorded rollouts (gitignored)
-└── logs/                     # TensorBoard runs (gitignored)
+Straight(length)
+Curve(length, radius, angle, dir)   # an arc, then a straight run-off
 ```
+
+So a circuit becomes data rather than code, and the same blocks that build the road
+also build a reference line for measuring progress.
+
+### Requirements this imposes
+
+- **Python 3.11.** MetaDrive declares `requires_python < 3.12`, so 3.11 is the newest
+  supported interpreter.
+- **No GPU required.** Training runs on CPU. See [Performance](#performance).
 
 ---
 
 ## Installation
 
-### Windows (read this first)
-
-`box2d-py` must be built against SWIG on Windows. **Install SWIG first**, then `gymnasium[box2d]`:
-
 ```bash
-pip install swig
-pip install "gymnasium[box2d]"
+git clone https://github.com/santhosh220z/Learn-to-drive-with-RL.git
+cd Learn-to-drive-with-RL
+
+uv venv .venv --python 3.11          # or: python -m venv .venv
+uv pip install --python .venv\Scripts\python.exe -e .
 ```
 
-If `box2d-py` build fails, ensure Microsoft Visual C++ build tools are installed (`pip install box2d-py` will compile from sdist otherwise). PyGame is also imported by CarRacing at reset.
-
-### Install the project
+**Optional, strongly recommended** — a CUDA build of PyTorch. The default PyPI wheel on
+Windows is CPU-only, and a rendered 3D observation is expensive:
 
 ```bash
-git clone <repo-url> Learn-to-drive-with-RL
-cd Learn-to-drive-with-RL
-python -m venv .venv
-.venv\Scripts\activate     # Windows
-# source .venv/bin/activate  # macOS / Linux
-pip install -e ".[dev]"
+uv pip install --python .venv\Scripts\python.exe torch --index-url https://download.pytorch.org/whl/cu124
+uv pip install --python .venv\Scripts\python.exe stable-baselines3 tensorboard
 ```
 
 Verify:
 
 ```bash
-python -c "import gymnasium as gym; e = gym.make('CarRacing-v3', continuous=True); print(e.observation_space, e.action_space)"
-```
-
-You should see `Box(0, 255, (96, 96, 3), uint8)` and `Box(-1, [+1,+1,+1], (3,), float32)`.
-
-Verify the full preprocessing pipeline:
-
-```bash
-python -c "
-from drive_rl.env import make_env, DummyVecEnv
-env = make_env(n_envs=1, vec_cls=DummyVecEnv)
-print('VecEnv obs space:', env.observation_space)
-print('Expected: Box(0, 255, (4, 84, 84), uint8)')
-"
+.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe -m drive_rl.train --preset smoke --dry-run
 ```
 
 ---
 
 ## Usage
 
-### Train (smoke test, ~30 seconds on CPU)
+### Train
+
+Training never starts implicitly. Every run prints a plan, **measures the environment's
+real throughput**, converts it into an estimated wall-clock time, and asks before
+committing — a run estimated at 2.5 hours that is really going to take two days is
+worth catching up front.
 
 ```bash
-python -m drive_rl.train --timesteps 10000 --n-envs 2
+# check the pipeline without training anything
+python -m drive_rl.train --preset smoke --dry-run
+
+# the usual first real run
+python -m drive_rl.train --preset balanced
+
+# 3D camera observations (much slower per step)
+python -m drive_rl.train --preset camera
+
+# override anything
+python -m drive_rl.train --preset balanced --circuit silverstone --n-envs 4
 ```
 
-### Train (headline baseline, uses GPU if available)
+| Preset | Steps | Obs | Intended use |
+| --- | --- | --- | --- |
+| `smoke` | 10k | state | Pipeline check. Will not drive. |
+| `fast` | 300k | state | Cheap run; usually laps, slowly. |
+| `balanced` | 1.5M | state | Default baseline on one circuit. |
+| `camera` | 1M | camera | 3D camera observations. |
+| `quality` | 4M | state | Long run; resume from a checkpoint. |
 
-```bash
-python -m drive_rl.train --timesteps 1000000 --n-envs 8 --seed 0
-```
-
-Defaults are stored in `configs/default_ppo.yaml` and overridable on the CLI:
-
-```bash
-python -m drive_rl.train --learning-rate 1e-4 --n-steps 1024 --ent-coef 0.01
-```
-
-Outputs:
-
-- `models/ppo_carracing_<timestamp>/final_model.zip`
-- `models/ppo_carracing_<timestamp>/best_eval/best_model.zip` (highest mean eval reward)
-- `models/ppo_carracing_<timestamp>/best_model_by_train_reward.zip` (highest mean training reward)
-- `models/ppo_carracing_<timestamp>/tb/` — TensorBoard logs
-- `models/ppo_carracing_<timestamp>/config_snapshot.json` — exact config used
+Outputs land in `models/<run>/`: `final_model.zip`, `best_eval/best_model.zip`,
+TensorBoard logs under `tb/`, and a `config_snapshot.json` recording the exact settings
+and the measured throughput.
 
 ### Evaluate
 
 ```bash
-python -m drive_rl.evaluate --model models/ppo_carracing_<ts>/best_eval/best_model.zip --n-episodes 20
+python -m drive_rl.evaluate --model models/<run>/best_eval/best_model.zip --episodes 20
 ```
 
-Writes `eval.json` with per-episode rewards and prints mean ± std.
+Reports lap times alongside **off-track percentage and worst line deviation**. On a
+fixed circuit a policy can turn a fast lap by cutting the run-off, so lap time alone is
+not a sufficient measure. Circuit and observation mode are read from the run's
+`config_snapshot.json` automatically.
 
-### Record a demo video
+### Watch
 
 ```bash
-python -m drive_rl.record_video --model models/ppo_carracing_<ts>/best_eval/best_model.zip --out-dir videos
+python -m drive_rl.watch --run-dir models/<run>
 ```
 
-Produces `videos/episode-0.mp4`.
+Polls the run directory and hot-reloads the best checkpoint whenever one is saved, so you
+can watch the policy improve without stopping training. Use `--model <path> --loop` to
+replay a single model.
 
-### TensorBoard
+### Record
 
 ```bash
-tensorboard --logdir models/ppo_carracing_<ts>/tb
+python -m drive_rl.record_video --model models/<run>/best_eval/best_model.zip
 ```
 
 ---
 
-## How it works
+## Circuits
 
-1. **`make_env()`** in [`src/drive_rl/env.py`](src/drive_rl/env.py) builds a vectorized CarRacing-v3 with the standard preprocessing chain:
-   - `gym.make("CarRacing-v3", continuous=True)` → `Box(steer, gas, brake) ∈ [-1,1]^3`
-   - Custom `GrayscaleResize` wrapper → `(84, 84, 1)` (RGB → grayscale + resize, keeps channel dim)
-   - SB3 `VecFrameStack(n_stack=4)` → `(4, 84, 84)` uint8
-2. **PPO** with `CnnPolicy` learns a policy over the frame stack.
-3. **`EvalCallback`** runs deterministic evaluation every `--eval-freq` steps and saves the best model.
-4. **`SaveBestModelByReward`** also tracks the best training reward, in case it diverges.
-5. **`evaluate.py`** runs N deterministic episodes and writes a JSON summary.
-6. **`record_video.py`** wraps the env in `RecordVideo` and saves an MP4 of one rollout.
+Circuits live as data in `src/drive_rl/circuits.py`, not as code.
 
-### Custom wrappers (opt-in)
+| Circuit | Length | Corners | Real circuit |
+| --- | --- | --- | --- |
+| `suzuka` | 4546 m | 16 | 5807 m, 18 turns |
+| `silverstone` | 3641 m | 12 | 5891 m, 18 turns |
+| `monaco` | 2221 m | 15 | 3337 m, 19 turns |
 
-`src/drive_rl/wrappers.py` provides three optional wrappers. All are **off by default** so the native reward remains the honest signal:
+**A circuit must close on itself** — the accumulated turn has to be one full revolution
+and the path has to return to its start, or the road network's end never meets its
+beginning and laps become impossible. MetaDrive builds a broken map *silently*, so
+`validate_circuit` checks both conditions and `tests/test_circuits.py` asserts them for
+every shipped circuit.
 
-- `ActionSmoothingWrapper(alpha=0.5)` — EMA over actions to reduce steering jitter.
-- `RewardShapingWrapper(steer_penalty=..., forward_bonus=...)` — gentle shaping hooks for ablations.
-- `FrameSkipWrapper(skip=4)` — repeat actions for K frames and sum rewards.
+Authoring is assisted by `tools/close_circuit.py`, which closes a draft numerically
+instead of by hand:
 
-Wire them in `env.py` if you want to use them.
+```bash
+python tools/close_circuit.py --list
+python tools/close_circuit.py suzuka --emit
+```
 
-### Fixed issues
+### Fidelity limits
 
-- **Channel dimension bug**: Gymnasium's `ResizeObservation` was dropping the channel dim (returning `(84, 84)` instead of `(84, 84, 1)`), causing `VecFrameStack` broadcast errors. Fixed with a custom `GrayscaleResize` wrapper using OpenCV that preserves the channel dimension.
-- **SubprocVecEnv pickling**: The env factory now returns a list of callables compatible with SB3's `make_vec_env` / `SubprocVecEnv` on Windows.
+These are deliberate approximations, not surveyed centrelines:
+
+- **Flat.** MetaDrive blocks are 2D, so Suzuka's ~40 m of elevation change is absent.
+- **Constant-radius corners.** Real corners vary in radius and compound; an "S" is
+  written as two opposite arcs.
+- **~20–30% shorter** than the real circuits, with fewer corners, as a consequence of the
+  above plus the closure solve.
+- **No crossover or kerbs.** Suzuka's bridge over the back straight cannot be expressed
+  by a flat non-intersecting block chain, and track edges are guardrails.
 
 ---
 
-## Targets & baselines
+## How the reward works
 
-The conventional **"solved" threshold** for CarRacing is mean reward ≥ 900 over 100 consecutive eval episodes. Realistic numbers for default PPO:
+Reward is expressed in **lap units**: a clean lap is worth `progress_reward`.
 
-| Configuration | Timesteps | Mean reward (approx) |
-| --- | --- | --- |
-| Vanilla PPO, default HP | 1M | 150–400 |
-| Vanilla PPO, zoo HP | 4M | 700–900 |
-| `RecurrentPPO` (sb3-contrib) | 4M | 850+ |
+That framing has a consequence worth stating, because getting it wrong silently ruins
+training. A step covers about 2 m of a 4546 m lap, so the progress reward *per step* is
+only ~0.005. Penalties are charged per step, so they must be scaled to match — an
+off-road penalty in single digits would be a thousand times the progress signal and
+would dominate every gradient.
 
-**This README's headline numbers will be filled in after a real run.**
+```text
+progress_reward   10.0    a full lap, prorated each step
+lateral_penalty   0.02    squared lateral offset, capped at 1.5 track-half-widths
+offroad_penalty   0.20    per step off the racing surface
+lap_bonus         5.0     for crossing the start/finish line
+```
+
+Laps are detected by the reference line's arc length wrapping past the end of the loop.
+Progress and lateral offset come from projecting the car onto the centreline built from
+the *same* geometry that built the road, so they stay well-defined across block
+boundaries and do not depend on MetaDrive's internal lane identifiers.
+
+---
+
+## Performance
+
+Measured on the development machine (4 cores / 8 threads, RTX 3050 6 GB, ~12 GB RAM):
+
+| Configuration | Throughput |
+| --- | --- |
+| State obs (lidar), headless | ~1135 env-steps/s |
+| 3D camera obs 84x84, offscreen | ~55 env-steps/s |
+| 3D camera obs 120x120, offscreen | ~55 env-steps/s |
+
+Resolution barely changes throughput, so the cost is per-step overhead rather than pixels.
+
+Two constraints shape how far this can be pushed:
+
+- **MetaDrive allows one environment instance per process**, so parallel environments
+  are separate processes and parallelism is capped at your core count.
+- **One env step is 0.1 s** (`decision_repeat=5` x `physics_world_step_size=0.02`), so a
+  Suzuka lap is ~820 steps.
+
+Always trust the ETA printed by `train.py` — it is measured on the environment it just
+built, not estimated from these numbers.
+
+---
+
+## Project structure
+
+```text
+src/drive_rl/
+├── circuits.py        Circuit specs, closure validation, reference line, map builder
+├── racing_env.py      RacingEnv: lap counting, racing reward, SB3 VecEnv factory
+├── train.py           PPO CLI with presets, --dry-run, measured ETA
+├── evaluate.py        Deterministic eval with lap times and line deviation
+├── watch.py           3D live viewer, hot-reloads the best checkpoint
+├── record_video.py    Offscreen 3D video capture
+├── callbacks.py       SB3 callback composition
+└── utils.py           Seeding, device selection, config snapshots
+tools/
+└── close_circuit.py   Offline circuit-closing authoring tool
+tests/
+├── test_circuits.py       Geometry, closure, reference line
+└── test_racing_env.py     Env contracts, camera layout, reward scaling
+```
 
 ---
 
 ## Development
 
 ```bash
-# Run all tests
 pytest -q
-
-# Lint + format
-ruff check src tests
-black src tests
+ruff check src tests tools
+black src tests tools
 ```
 
-`tests/test_train_smoke.py` runs a 512-step PPO integration test; it is skipped automatically if `gymnasium[box2d]` is not installed.
-
----
+`tests/test_racing_env.py` builds real MetaDrive environments and is skipped when
+MetaDrive is unavailable. The geometry tests always run.
 
 ## License
 
