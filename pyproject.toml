@@ -4,38 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drive-rl"
-version = "0.1.0"
-description = "Teach an RL agent to drive on Gymnasium CarRacing-v3 with PPO."
+version = "0.2.0"
+description = "Train a reinforcement-learning racing driver on MetaDrive."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+# MetaDrive requires Python < 3.12 (see its `requires_python` metadata), so the
+# 3.10-3.11 range is deliberate rather than a legacy constraint.
+requires-python = ">=3.10,<3.12"
 authors = [{ name = "Learn-to-Drive-with-RL contributors" }]
-keywords = ["reinforcement-learning", "ppo", "gymnasium", "self-driving", "car-racing"]
+keywords = ["reinforcement-learning", "ppo", "autonomous-driving", "racing", "metadrive"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Framework :: PyTorch",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 dependencies = [
-    # Core RL stack
+    # Simulation. MetaDrive pins python <3.12 and brings Panda3D + Bullet.
+    "metadrive-simulator>=0.4.3",
+    # RL stack
     "stable-baselines3>=2.3.0",
-    "sb3-contrib>=1.8.0",
-    "gymnasium[box2d]>=0.29.1",
-    # Deep learning backend
+    # Deep learning backend. On Windows, install a CUDA build explicitly:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cu124
     "torch>=2.1.0",
-    # Computer vision / image processing
-    "opencv-python>=4.8.0",
-    "numpy>=1.24.0",
-    # Logging + monitoring
+    # Logging
     "tensorboard>=2.15.0",
-    # Rendering (required at import time by CarRacing even for headless use)
-    "pygame>=2.5.0",
-    # Building box2d-py on Windows
-    "swig>=4.1.0",
+    "numpy>=1.24.0",
+    # Video encoding (MetaDrive pulls mediapy, which needs it)
+    "imageio-ffmpeg>=0.4.9",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +48,7 @@ dev = [
 drive-rl-train = "drive_rl.train:main"
 drive-rl-evaluate = "drive_rl.evaluate:main"
 drive-rl-record = "drive_rl.record_video:main"
+drive-rl-watch = "drive_rl.watch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -58,7 +57,7 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
 filterwarnings = [
-    "ignore::DeprecationWarning:gymnasium.*",
+    "ignore::DeprecationWarning:metadrive.*",
     "ignore::DeprecationWarning:stable_baselines3.*",
 ]
 
